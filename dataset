@@ -1,0 +1,197 @@
+import pandas as pd
+import numpy as np
+import torch
+from transformers import BertTokenizer, BertModel
+import librosa
+meld_df_test = pd.read_csv('/Users/zhao/Desktop/MELD.Raw/test_sent_emo.csv')
+meld_df_train = pd.read_csv('/Users/zhao/Desktop/MELD.Raw/train/train_sent_emo.csv') 
+print(meld_df_train.head())
+tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+model = BertModel.from_pretrained("bert-base-uncased")
+def extract_text_features(text):
+    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=128)
+    outputs = model(**inputs)
+    return outputs.last_hidden_state.mean(dim=1) 
+'''
+from moviepy import AudioFileClip
+import os
+
+def convert_mp4_audio_to_wav(input_file, output_file):
+    # Load the audio clip
+    audio_clip = AudioFileClip(input_file,fps=48000, nbytes=2)
+    
+    # Write the audio clip to a WAV file
+    audio_clip.write_audiofile(output_file)
+    
+    # Close the audio clip
+    audio_clip.close()
+    return output_file
+'''
+import subprocess
+import librosa
+
+def convert_mp4_audio_to_wav1(input_file, output_file):
+    # 使用 FFmpeg 提取音频并转换为 WAV 格式
+    
+    command = [
+            'ffmpeg', '-i', input_file, 
+            '-vn',            # 禁用视频
+            '-ac', '2',       # 设置音频通道数为2（立体声）
+            '-ar', '44100',   # 设置音频采样率
+            '-acodec', 'pcm_s16le',  # 设置音频编码格式为 PCM
+            output_file
+        ]
+    subprocess.run(command, check=True)  # 执行命令
+    return output_file
+  def extract_audio_features(video_file_path, audio_path):
+    # mp4 转 wav
+    new_audio_path = convert_mp4_audio_to_wav1(video_file_path, audio_path)            
+    
+    # 提取音频特征
+    y, sr = librosa.load(new_audio_path, sr=None)  # sr=None 保持原采样率
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
+    
+    # 计算 MFCC 的均值
+    audio_feat = np.mean(mfcc.T, axis=0)
+
+    return audio_feat
+  import torch.nn as nn
+
+class AttentionFusion(nn.Module):
+    def __init__(self, input_dim_text, input_dim_audio, hidden_dim):
+        super(AttentionFusion, self).__init__()
+        self.W_q = nn.Linear(input_dim_text, hidden_dim)
+        self.W_k = nn.Linear(input_dim_audio, hidden_dim)
+        self.W_v = nn.Linear(input_dim_audio, hidden_dim)
+        self.softmax = nn.Softmax(dim=1)
+        
+    def forward(self, text_feat, audio_feat):
+        query = self.W_q(text_feat)
+        key = self.W_k(audio_feat)
+        value = self.W_v(audio_feat)
+        
+        attention_scores = torch.matmul(query, key.T) / torch.sqrt(torch.tensor(query.shape[-1]).float())
+        attention_weights = self.softmax(attention_scores)
+        attended_audio = torch.matmul(attention_weights, value)
+        
+        return torch.cat([text_feat, attended_audio], dim=1)
+class EmotionClassifier(nn.Module):
+    def __init__(self, fusion_dim, num_classes):
+        super(EmotionClassifier, self).__init__()
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=fusion_dim, nhead=4), num_layers=2
+        )
+        self.fc = nn.Linear(fusion_dim, num_classes)
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, fused_feat):
+        out = self.transformer(fused_feat.unsqueeze(0))
+        out = self.fc(out.squeeze(0))
+        return self.softmax(out)
+import subprocess
+import os
+import torch.optim as optim
+
+fusion_model = AttentionFusion(768, 40, 128)
+classifier = EmotionClassifier(768 + 128, 7)  # 7类情绪
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(list(fusion_model.parameters()) + list(classifier.parameters()), lr=1e-4)
+
+for epoch in range(50):
+    for index, row in meld_df_train.iterrows():
+        text_feat = extract_text_features(row["Utterance"])
+
+        video_file_path = os.path.join('/Users/zhao/Desktop/MELD.Raw/train/train_splits', f"dia{str(row['Dialogue_ID'])}_utt{str(row['Utterance_ID'])}.mp4")
+        print('video path', video_file_path)
+
+        if os.path.exists(video_file_path):
+            try:
+                # 提取音频特征
+                audio_path = os.path.join('/Users/zhao/Desktop/MELD.Raw/train/train_splits', f"dia{str(row['Dialogue_ID'])}_utt{str(row['Utterance_ID'])}.wav")
+                print('audio path', audio_path)
+                
+                # 调用提取音频特征的函数
+                audio_feat = extract_audio_features(video_file_path, audio_path)
+            
+            except subprocess.CalledProcessError as e:
+                print(f"Error with ffmpeg processing {video_file_path}: {e}. Skipping this file.")
+                continue  # 跳过当前文件
+            
+            except OSError as e:
+                if "Invalid data found when processing input" in str(e):
+                    print(f"Invalid data found in {video_file_path}. Skipping this file.")
+                else:
+                    print(f"OSError encountered while processing {video_file_path}: {e}. Skipping this file.")
+                continue  # 跳过当前文件
+           except Exception as e:
+                print(f"Unexpected error encountered with {video_file_path}: {e}. Skipping this file.")
+                continue  # 跳过其他异常的文件
+            
+        else:
+            print(f"File not found: {video_file_path}")
+            continue  # 跳过文件不存在的情况
+        fused_feat = fusion_model(text_feat, torch.tensor(audio_feat).unsqueeze(0).float())
+        pred = classifier(fused_feat)
+        label_dict = {"neutral": 0, "joy": 1, "sadness": 2, "anger": 3, "surprise": 4, "fear": 5, "disgust": 6}
+        label = torch.tensor(label_dict[row["Emotion"].lower()])
+
+        loss = criterion(pred, label.unsqueeze(0))
+        
+        # 优化
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    print("Loss:",loss.item())
+'''
+fusion_model = AttentionFusion(768, 40, 128)
+classifier = EmotionClassifier(768 + 128, 7)  # 7类情绪
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(list(fusion_model.parameters()) + list(classifier.parameters()), lr=1e-4)
+
+for epoch in range(50):
+    for index, row in meld_df_train.iterrows():
+        text_feat = extract_text_features(row["Utterance"])
+        
+        video_file_path = os.path.join('/Users/zhao/Desktop/MELD.Raw/train/train_splits', f"dia{str(row['Dialogue_ID'])}_utt{str(row['Utterance_ID'])}.mp4")
+        print('video path',video_file_path)
+        if os.path.exists(video_file_path):
+
+            audio_path = os.path.join('/Users/zhao/Desktop/MELD.Raw/train/train_splits', f"dia{str(row['Dialogue_ID'])}_utt{str(row['Utterance_ID'])}.wav")
+            print('audio path',audio_path)
+            audio_feat = extract_audio_features(video_file_path,audio_path)
+            
+        else:
+            print(f"File not found: {video_file_path}")
+            continue  
+
+        # 融合特征并分类
+        fused_feat = fusion_model(text_feat, torch.tensor(audio_feat).unsqueeze(0).float())
+        pred = classifier(fused_feat)
+        label_dict = {"neutral": 0, "joy": 1, "sadness": 2, "anger": 3, "surprise": 4, "fear": 5, "disgust": 6}
+        label = torch.tensor(label_dict[row["Emotion"].lower()])
+
+        loss = criterion(pred, label.unsqueeze(0))
+        
+        # 优化
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    print( Loss: {loss.item()}")
+'''
+from sklearn.metrics import f1_score
+
+def evaluate():
+    preds = []
+    labels = []
+    for index, row in meld_df_test.iterrows():
+        text_feat = extract_text_features(row["Utterance"])
+        audio_feat = extract_audio_features("audio_path/"+str(row["Dialogue_ID"]) + ".wav")
+        fused_feat = fusion_model(text_feat, torch.tensor(audio_feat).unsqueeze(0).float())
+        pred = classifier(fused_feat)
+        
+        preds.append(torch.argmax(pred).item())
+        labels.append(row["Emotion"])
+
+    print("F1-Score:", f1_score(labels, preds, average="weighted"))
